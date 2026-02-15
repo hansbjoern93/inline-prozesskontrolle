@@ -1,2 +1,2 @@
 # inline-prozesskontrolle
-Event-driven streaming architecture for real-time inline process control using Kafka, Python, and optional Redis.
+Real-time inline process analytics for inductive wire hardening using Kafka-based streaming, windowed statistical methods, and event-driven architecture.
