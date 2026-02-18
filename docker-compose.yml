@@ -1,20 +1,31 @@
-version: "3.8"
-
 services:
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_KRAFT_MODE: "true"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT_INTERNAL"
+
       KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
 
   redis:
     image: redis:7.4-alpine
@@ -24,6 +35,36 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
+
+  corr-analyzer:
+    build: .
+    container_name: corr-analyzer
+    depends_on:
+      - kafka
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:29092"
+      INPUT_TOPIC: "1031103_1000"
+      OUTPUT_TOPIC: "1031103_1000_corr"
+      WINDOW_SIZE_SEC: "300"
+      WINDOW_TYPE: "tumbling"
+      MIN_POINTS: "2500"
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+
+  kafka-producer:
+    build: .
+    container_name: kafka-producer
+    depends_on:
+      - kafka
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command: >
+      python -u src/producer/kafka_producer.py
+      --speed 1
+      --bootstrap-servers kafka:29092
+      --topic 1031103_1000
+      --file data/process_data.json
+    restart: unless-stopped
 
 volumes:
   redis-data:
