@@ -3,7 +3,6 @@ services:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     ports:
-      - "9092:9092"
       - "29092:29092"
     environment:
       KAFKA_KRAFT_MODE: "true"
@@ -14,9 +13,9 @@ services:
 
       CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
 
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT_INTERNAL://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_INTERNAL://kafka:9092,PLAINTEXT_HOST://localhost:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT_INTERNAL"
 
       KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
@@ -26,6 +25,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_MIN_INSYNC_REPLICAS: 1
+
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "cub kafka-ready -b localhost:9092 1 20"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   redis:
     image: redis:7.4-alpine
@@ -40,30 +45,32 @@ services:
     build: .
     container_name: corr-analyzer
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+      kafka-producer:
+        condition: service_started
+      redis:
+        condition: service_started
     environment:
-      BOOTSTRAP_SERVERS: "kafka:29092"
+      BOOTSTRAP_SERVERS: "kafka:9092"
       INPUT_TOPIC: "1031103_1000"
       OUTPUT_TOPIC: "1031103_1000_corr"
       WINDOW_SIZE_SEC: "300"
       WINDOW_TYPE: "tumbling"
       MIN_POINTS: "2500"
       PYTHONUNBUFFERED: "1"
+    command: ["python", "-u", "src/analytics/correlation_analyzer.py"]
     restart: unless-stopped
 
   kafka-producer:
     build: .
     container_name: kafka-producer
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     environment:
       PYTHONUNBUFFERED: "1"
-    command: >
-      python -u src/producer/kafka_producer.py
-      --speed 1
-      --bootstrap-servers kafka:29092
-      --topic 1031103_1000
-      --file data/process_data.json
+    command: ["python", "-u", "src/producer/kafka_producer.py", "--speed", "1", "--bootstrap-servers", "kafka:9092", "--topic", "1031103_1000", "--file", "data/process_data.json"]
     restart: unless-stopped
 
 volumes:

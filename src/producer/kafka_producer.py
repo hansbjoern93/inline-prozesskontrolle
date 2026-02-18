@@ -4,11 +4,12 @@ import argparse
 from datetime import datetime
 from confluent_kafka import Producer
 import sys
+import os
 
 # --- Configuration ---
 DEFAULT_TOPIC = "1031103_1000"
-BOOTSTRAP_SERVERS = 'localhost:9092'
-DATA_FILE = '../data/process_data.json' # Relative path assumption
+BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:29092")
+DATA_FILE = '../data/process_data.json'
 
 def delivery_report(err, msg):
     """ Called once for each message produced to indicate delivery result.

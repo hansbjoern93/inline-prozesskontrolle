@@ -25,7 +25,7 @@ def get_pd_value(record: dict, wanted_name: str):
 
 
 def main():
-    bootstrap = os.getenv("BOOTSTRAP_SERVERS", "kafka:29092")
+    bootstrap = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
     input_topic = os.getenv("INPUT_TOPIC", "1031103_1000")
     output_topic = os.getenv("OUTPUT_TOPIC", "1031103_1000_corr")
     window_size = float(os.getenv("WINDOW_SIZE_SEC", "300"))
