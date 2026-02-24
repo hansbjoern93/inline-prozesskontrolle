@@ -41,6 +41,22 @@ services:
     volumes:
       - redis-data:/data
 
+  kafka-producer:
+    build: .
+    container_name: kafka-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command:
+      ["python", "-u", "src/producer/kafka_producer.py",
+       "--speed", "1",
+       "--bootstrap-servers", "kafka:9092",
+       "--topic", "1031103_1000",
+       "--file", "data/process_data.json"]
+    restart: unless-stopped
+
   corr-analyzer:
     build: .
     container_name: corr-analyzer
@@ -62,15 +78,123 @@ services:
     command: ["python", "-u", "src/analytics/correlation_analyzer.py"]
     restart: unless-stopped
 
-  kafka-producer:
+  six-sigma-monitor:
     build: .
-    container_name: kafka-producer
+    container_name: six-sigma-monitor
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-producer:
+        condition: service_started
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      INPUT_TOPIC: "1031103_1000"
+      ALERT_TOPIC: "1031103_801"
+      WINDOW_SECONDS: "300"
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "-u", "src/analytics/six_sigma_monitor.py"]
+    restart: unless-stopped
+
+  profile-detector:
+    build: .
+    container_name: profile-detector
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-producer:
+        condition: service_started
     environment:
       PYTHONUNBUFFERED: "1"
-    command: ["python", "-u", "src/producer/kafka_producer.py", "--speed", "1", "--bootstrap-servers", "kafka:9092", "--topic", "1031103_1000", "--file", "data/process_data.json"]
+
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_INPUT_TOPIC: "1031103_1000"
+      KAFKA_GROUP_ID: "wire_profile_detector"
+      KAFKA_AUTO_OFFSET_RESET: "latest"
+
+      LOG_LEVEL: "INFO"
+      HEARTBEAT_EVERY_MSGS: "0"
+
+      NOK_DEVIATION_MM: "30"
+
+      SMOOTH_WINDOW: "3"
+      SIGMA_FACTOR: "3.0"
+      SIGMA_MIN_POINTS: "20"
+      SIGMA_MIN_STD: "0.05"
+      HYSTERESIS_COUNT: "3"
+      TREND_WINDOW: "10"
+      SLOPE_FLAT_THRESHOLD: "0.003"
+      FLAT_LOOKBACK_PTS: "5"
+
+      MIN_SPACE_MM: "200"
+      MIN_RISE_MM: "100"
+      MIN_PLATEAU_MM: "500"
+      MIN_FALL_MM: "100"
+
+      RESET_ON_NONMONOTONIC_LENGTH: "true"
+      NONMONO_RESET_DELTA_MM: "1000"
+
+    command: ["python", "-u", "src/analytics/profile_detector.py"]
+    restart: unless-stopped
+
+  wire-visualizer:
+    build: .
+    container_name: wire-visualizer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      profile-detector:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_INPUT_TOPIC: "1031103_1000"
+      KAFKA_GROUP_ID: "wire_visualizer"
+      KAFKA_AUTO_OFFSET_RESET: "latest"
+
+      KAFKA_PROFILES_TOPIC: "1031103_1000_profiles"
+      KAFKA_NIO_TOPIC: "1031103_1000_profile_events"
+
+      
+      FIELD_LENGTH: "fDrahtlaenge1 (Drehgeber)"
+      FIELD_DIAMETER: "fDurchmesser1 (Haerten)"
+      FIELD_HARD_TEMP: "fHaertetemperatur (Haerten)"
+      FIELD_TEMPER_TEMP: "fAnlasstemperatur (Anlassen)"
+
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_STREAM_PLOT: "wire:plot"
+      REDIS_STREAM_METRICS: "wire:metrics"
+
+      ENABLE_PLOT: "false"
+      LOG_LEVEL: "INFO"
+
+    command: ["python", "-u", "src/dashboard/wire_visualizer_redis.py"]
+    restart: unless-stopped
+
+  wire-dashboard:
+    build: .
+    container_name: wire-dashboard
+    depends_on:
+      redis:
+        condition: service_started
+      wire-visualizer:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_STREAM_PLOT: "wire:plot"
+      REDIS_STREAM_METRICS: "wire:metrics"
+      MAX_POINTS: "3000"
+      REFRESH_SECONDS: "1.0"
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    command: ["streamlit", "run", "/app/src/dashboard/wire_dashboard.py", "--server.address=0.0.0.0", "--server.port=8501"]
     restart: unless-stopped
 
 volumes:

@@ -1,2 +1,6 @@
 confluent-kafka
 numpy
+streamlit
+pandas
+redis
+plotly
