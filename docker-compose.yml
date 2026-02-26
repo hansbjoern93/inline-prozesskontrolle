@@ -109,7 +109,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_INPUT_TOPIC: "1031103_1000"
       KAFKA_GROUP_ID: "wire_profile_detector"
-      KAFKA_AUTO_OFFSET_RESET: "latest"
+      KAFKA_AUTO_OFFSET_RESET: "earliest"
 
       LOG_LEVEL: "INFO"
       HEARTBEAT_EVERY_MSGS: "0"
@@ -152,7 +152,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_INPUT_TOPIC: "1031103_1000"
       KAFKA_GROUP_ID: "wire_visualizer"
-      KAFKA_AUTO_OFFSET_RESET: "latest"
+      KAFKA_AUTO_OFFSET_RESET: "earliest"
 
       KAFKA_PROFILES_TOPIC: "1031103_1000_profiles"
       KAFKA_NIO_TOPIC: "1031103_1000_profile_events"
