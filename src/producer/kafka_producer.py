@@ -8,7 +8,7 @@ import os
 
 # --- Configuration ---
 DEFAULT_TOPIC = "1031103_1000"
-BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:29092")
+BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
 DATA_FILE = '../data/process_data.json'
 
 def delivery_report(err, msg):

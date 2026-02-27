@@ -20,6 +20,7 @@ services:
 
       KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
 
+      # single-broker safe defaults
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -32,23 +33,12 @@ services:
       timeout: 5s
       retries: 20
 
-  redis:
-    image: redis:7.4-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-
   kafka-producer:
     build: .
     container_name: kafka-producer
     depends_on:
       kafka:
         condition: service_healthy
-    environment:
-      PYTHONUNBUFFERED: "1"
     command:
       ["python", "-u", "src/producer/kafka_producer.py",
        "--speed", "1",
@@ -65,16 +55,12 @@ services:
         condition: service_healthy
       kafka-producer:
         condition: service_started
-      redis:
-        condition: service_started
     environment:
       BOOTSTRAP_SERVERS: "kafka:9092"
       INPUT_TOPIC: "1031103_1000"
       OUTPUT_TOPIC: "1031103_1000_corr"
       WINDOW_SIZE_SEC: "300"
-      WINDOW_TYPE: "tumbling"
       MIN_POINTS: "2500"
-      PYTHONUNBUFFERED: "1"
     command: ["python", "-u", "src/analytics/correlation_analyzer.py"]
     restart: unless-stopped
 
@@ -91,7 +77,6 @@ services:
       INPUT_TOPIC: "1031103_1000"
       ALERT_TOPIC: "1031103_801"
       WINDOW_SECONDS: "300"
-      PYTHONUNBUFFERED: "1"
     command: ["python", "-u", "src/analytics/six_sigma_monitor.py"]
     restart: unless-stopped
 
@@ -104,98 +89,47 @@ services:
       kafka-producer:
         condition: service_started
     environment:
-      PYTHONUNBUFFERED: "1"
-
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_INPUT_TOPIC: "1031103_1000"
       KAFKA_GROUP_ID: "wire_profile_detector"
       KAFKA_AUTO_OFFSET_RESET: "earliest"
 
       LOG_LEVEL: "INFO"
-      HEARTBEAT_EVERY_MSGS: "0"
-
       NOK_DEVIATION_MM: "30"
-
-      SMOOTH_WINDOW: "3"
-      SIGMA_FACTOR: "3.0"
-      SIGMA_MIN_POINTS: "20"
-      SIGMA_MIN_STD: "0.05"
-      HYSTERESIS_COUNT: "3"
-      TREND_WINDOW: "10"
-      SLOPE_FLAT_THRESHOLD: "0.003"
-      FLAT_LOOKBACK_PTS: "5"
-
-      MIN_SPACE_MM: "200"
-      MIN_RISE_MM: "100"
-      MIN_PLATEAU_MM: "500"
-      MIN_FALL_MM: "100"
 
       RESET_ON_NONMONOTONIC_LENGTH: "true"
       NONMONO_RESET_DELTA_MM: "1000"
-
     command: ["python", "-u", "src/analytics/profile_detector.py"]
-    restart: unless-stopped
-
-  wire-visualizer:
-    build: .
-    container_name: wire-visualizer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      profile-detector:
-        condition: service_started
-    environment:
-      PYTHONUNBUFFERED: "1"
-
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-      KAFKA_INPUT_TOPIC: "1031103_1000"
-      KAFKA_GROUP_ID: "wire_visualizer"
-      KAFKA_AUTO_OFFSET_RESET: "earliest"
-
-      KAFKA_PROFILES_TOPIC: "1031103_1000_profiles"
-      KAFKA_NIO_TOPIC: "1031103_1000_profile_events"
-
-      
-      FIELD_LENGTH: "fDrahtlaenge1 (Drehgeber)"
-      FIELD_DIAMETER: "fDurchmesser1 (Haerten)"
-      FIELD_HARD_TEMP: "fHaertetemperatur (Haerten)"
-      FIELD_TEMPER_TEMP: "fAnlasstemperatur (Anlassen)"
-
-      REDIS_HOST: "redis"
-      REDIS_PORT: "6379"
-      REDIS_STREAM_PLOT: "wire:plot"
-      REDIS_STREAM_METRICS: "wire:metrics"
-
-      ENABLE_PLOT: "false"
-      LOG_LEVEL: "INFO"
-
-    command: ["python", "-u", "src/dashboard/wire_visualizer_redis.py"]
     restart: unless-stopped
 
   wire-dashboard:
     build: .
     container_name: wire-dashboard
     depends_on:
-      redis:
+      kafka:
+        condition: service_healthy
+      kafka-producer:
         condition: service_started
-      wire-visualizer:
+      profile-detector:
         condition: service_started
     environment:
-      PYTHONUNBUFFERED: "1"
-      REDIS_HOST: "redis"
-      REDIS_PORT: "6379"
-      REDIS_STREAM_PLOT: "wire:plot"
-      REDIS_STREAM_METRICS: "wire:metrics"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_INPUT_TOPIC: "1031103_1000"
+      KAFKA_GROUP_ID: "wire-dashboard-live"
+      KAFKA_AUTO_OFFSET_RESET: "earliest"
+      ENABLE_REDIS_CACHE: "false"
       MAX_POINTS: "3000"
       REFRESH_SECONDS: "1.0"
     ports:
       - "8501:8501"
     volumes:
       - ./:/app
-    command: ["streamlit", "run", "/app/src/dashboard/wire_dashboard.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    command:
+      [
+        "streamlit",
+        "run",
+        "/app/src/dashboard/wire_dashboard.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501"
+      ]
     restart: unless-stopped
-
-volumes:
-  redis-data:

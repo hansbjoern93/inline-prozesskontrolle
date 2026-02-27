@@ -104,7 +104,6 @@ def _get_redis() -> Optional["redis.Redis"]:
 
 
 def _redis_xadd_plot(r: "redis.Redis", p: PlotPoint) -> None:
-    # Store the plot point (as cache)
     fields = {
         "length_mm": f"{p.length_mm}",
         "diameter_mm": f"{p.diameter_mm}",
@@ -131,7 +130,6 @@ def _redis_xadd_metrics(r: "redis.Redis", total_profiles: int, nio_profiles: int
 
 
 def _redis_clear_streams(r: "redis.Redis") -> None:
-    # easiest: delete streams completely (they get recreated on next xadd)
     try:
         r.delete(STREAM_PLOT)
     except Exception:
@@ -147,6 +145,7 @@ def _redis_clear_streams(r: "redis.Redis") -> None:
 # -----------------------------
 class StreamState:
     """Thread-safe shared state between Kafka polling thread and Streamlit UI."""
+
     def __init__(self, max_points: int):
         self.lock = threading.Lock()
         self.points: Deque[PlotPoint] = deque(maxlen=max_points)
@@ -210,6 +209,7 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
     try:
         while not stop_event.is_set():
             msg = consumer.poll(0.5)
+
             if msg is None:
                 # maybe flush metrics periodically even without messages
                 now = time.time()
@@ -225,7 +225,6 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
                                 _redis_xadd_metrics(rr, t, n, ts)
                                 last_metrics_total, last_metrics_nio, last_metrics_ts = t, n, ts
                             except Exception:
-                                # ignore redis issues, UI still works
                                 pass
                         last_metrics_flush = now
                 continue
@@ -235,13 +234,17 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
                     state.last_error = str(msg.error())
                 continue
 
+            # If we are here, message is OK -> clear any old error
+            with state.lock:
+                state.last_error = None
+
             topic = msg.topic()
 
             # 1) KPI events (counts) based on topic
             if topic == TOPIC_PROFILES:
                 with state.lock:
                     state.total_profiles += 1
-                # flush metrics (throttled)
+
                 now = time.time()
                 if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
                     rr = ensure_redis()
@@ -261,7 +264,7 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
             if topic == TOPIC_NIO:
                 with state.lock:
                     state.nio_profiles += 1
-                # flush metrics (throttled)
+
                 now = time.time()
                 if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
                     rr = ensure_redis()
@@ -288,7 +291,6 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
                     state.points.append(p)
                     state.last_raw_ts = p.ts
 
-                # write cache point to Redis
                 if ENABLE_REDIS_CACHE:
                     rr = ensure_redis()
                     if rr is not None:
@@ -297,7 +299,6 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
                         except Exception:
                             pass
 
-                # metrics flush (throttled)
                 now = time.time()
                 if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
                     rr = ensure_redis()
@@ -375,11 +376,9 @@ if "stream_state" not in st.session_state:
 
 state: StreamState = st.session_state.stream_state
 
-# Controls
 col_a, col_b = st.columns([1, 3])
 
 if col_a.button("Reset (RAM + Redis Cache)"):
-    # reset RAM
     with state.lock:
         state.points.clear()
         state.total_profiles = 0
@@ -387,11 +386,10 @@ if col_a.button("Reset (RAM + Redis Cache)"):
         state.last_raw_ts = None
         state.last_error = None
 
-    # reset Redis streams (cache)
     if ENABLE_REDIS_CACHE:
-        r = _get_redis()
-        if r is not None:
-            _redis_clear_streams(r)
+        rr = _get_redis()
+        if rr is not None:
+            _redis_clear_streams(rr)
 
 # Snapshot for UI render
 with state.lock:
@@ -416,16 +414,15 @@ if last_err:
 if not points:
     st.info("Noch keine RAW-Daten empfangen. Läuft der Producer? Ist das RAW-Topic korrekt?")
 else:
-    rows = []
-    for p in points:
-        rows.append(
-            {
-                "length_mm": p.length_mm,
-                "diameter_mm": p.diameter_mm,
-                "hard_temp": p.hard_temp if p.hard_temp is not None else float("nan"),
-                "temper_temp": p.temper_temp if p.temper_temp is not None else float("nan"),
-            }
-        )
+    rows = [
+        {
+            "length_mm": p.length_mm,
+            "diameter_mm": p.diameter_mm,
+            "hard_temp": p.hard_temp if p.hard_temp is not None else float("nan"),
+            "temper_temp": p.temper_temp if p.temper_temp is not None else float("nan"),
+        }
+        for p in points
+    ]
 
     df = (
         pd.DataFrame(rows)
@@ -441,7 +438,6 @@ else:
     y_h = df["hard_temp"].tolist()
     y_t = df["temper_temp"].tolist()
 
-    # Break line on length jumps (e.g., reset/new coil)
     for i in range(1, len(x)):
         if abs(x[i] - x[i - 1]) > BREAK_DELTA:
             y_d[i] = None
@@ -461,10 +457,11 @@ else:
         margin=dict(l=40, r=40, t=40, b=60),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    # Streamlit warning says use width='stretch' instead of use_container_width=True
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("Letzte Punkte (Debug)"):
-        st.dataframe(df.tail(25))
+        st.dataframe(df.tail(25), width="stretch")
 
 # Auto refresh
 if auto:
