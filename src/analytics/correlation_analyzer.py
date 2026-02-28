@@ -1,4 +1,4 @@
-import os, json, time
+import os, json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -34,7 +34,7 @@ def main():
     consumer = Consumer({
         "bootstrap.servers": bootstrap,
         "group.id": "corr-analyzer",
-        "auto.offset.reset": "latest",   # wichtig: nicht 15 Mio alte Nachrichten lesen
+        "auto.offset.reset": "latest",   
         "enable.auto.commit": True
     })
     producer = Producer({"bootstrap.servers": bootstrap})

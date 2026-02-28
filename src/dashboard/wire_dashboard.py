@@ -3,24 +3,22 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Optional
+from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-import redis
 from confluent_kafka import Consumer
 
+import redis
+
 
 # -----------------------------
-# ENV / Config
+# Config (ENV)
 # -----------------------------
-# Kafka
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", os.getenv("BOOTSTRAP_SERVERS", "kafka:9092"))
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "wire-dashboard")
-OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest")  # safest for "see everything"
+OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
 TOPIC_RAW = os.getenv("KAFKA_INPUT_TOPIC", os.getenv("INPUT_TOPIC", "1031103_1000"))
 TOPIC_PROFILES = os.getenv("KAFKA_PROFILES_TOPIC", f"{TOPIC_RAW}_profiles")
@@ -32,10 +30,12 @@ FIELD_HARD_TEMP = os.getenv("FIELD_HARD_TEMP", "fHaertetemperatur (Haerten)")
 FIELD_TEMPER_TEMP = os.getenv("FIELD_TEMPER_TEMP", "fAnlasstemperatur (Anlassen)")
 
 MAX_POINTS = int(os.getenv("MAX_POINTS", "3000"))
+MAX_NIO_DEBUG = int(os.getenv("MAX_NIO_DEBUG", "20"))
+BREAK_DELTA = float(os.getenv("BREAK_DELTA_MM", "5000"))
 REFRESH_S = float(os.getenv("REFRESH_SECONDS", "1.0"))
-BREAK_DELTA = float(os.getenv("BREAK_DELTA_MM", "5000"))  # line break if length jumps too much
+NOK_MM = float(os.getenv("NOK_DEVIATION_MM", "30.0"))
 
-# Redis cache (optional, but ON by default for option 2)
+# Redis Streams (bleibt drin)
 ENABLE_REDIS_CACHE = os.getenv("ENABLE_REDIS_CACHE", "true").lower() in ("1", "true", "yes", "y", "on")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -46,53 +46,93 @@ STREAM_METRICS = os.getenv("REDIS_STREAM_METRICS", "wire:metrics")
 REDIS_MAXLEN_PLOT = int(os.getenv("REDIS_MAXLEN_PLOT", str(MAX_POINTS)))
 REDIS_MAXLEN_METRICS = int(os.getenv("REDIS_MAXLEN_METRICS", "1000"))
 
-# throttle for writing metrics (avoid xadd too often)
-METRICS_FLUSH_EVERY_S = float(os.getenv("METRICS_FLUSH_EVERY_S", "1.0"))
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _pd_value(record: dict, wanted_name: str) -> Optional[float]:
-    for item in record.get("ProcessData", []):
-        if item.get("Name") == wanted_name:
-            try:
-                return float(item.get("Value"))
-            except Exception:
-                return None
-    return None
-
-
-@dataclass
-class PlotPoint:
-    length_mm: float
-    diameter_mm: float
-    hard_temp: Optional[float]
-    temper_temp: Optional[float]
-    ts: Optional[str]
-
-
-def _parse_raw_message(raw: bytes) -> Optional[PlotPoint]:
+def safe_float(x) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip().replace(",", ".")
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
     try:
-        data = json.loads(raw.decode("utf-8"))
+        return float(x)
     except Exception:
         return None
 
-    length = _pd_value(data, FIELD_LENGTH)
-    diam = _pd_value(data, FIELD_DIAMETER)
+
+def pd_value(record: dict, wanted_name: str) -> Optional[float]:
+    for item in record.get("ProcessData", []):
+        if item.get("Name") == wanted_name:
+            return safe_float(item.get("Value"))
+    return None
+
+
+def parse_raw(b: bytes) -> Optional[dict]:
+    try:
+        data = json.loads(b.decode("utf-8"))
+    except Exception:
+        return None
+
+    length = pd_value(data, FIELD_LENGTH)
+    diam = pd_value(data, FIELD_DIAMETER)
     if length is None or diam is None:
         return None
 
-    return PlotPoint(
-        length_mm=float(length),
-        diameter_mm=float(diam),
-        hard_temp=_pd_value(data, FIELD_HARD_TEMP),
-        temper_temp=_pd_value(data, FIELD_TEMPER_TEMP),
-        ts=data.get("Time"),
+    return {
+        "length_mm": float(length),
+        "diameter_mm": float(diam),
+        "hard_temp": pd_value(data, FIELD_HARD_TEMP),
+        "temper_temp": pd_value(data, FIELD_TEMPER_TEMP),
+        "ts": data.get("Time"),
+    }
+
+
+def parse_profile(b: bytes) -> Optional[dict]:
+    try:
+        data = json.loads(b.decode("utf-8"))
+    except Exception:
+        return None
+
+    p = {
+        "profile_id": data.get("profile_id"),
+        "L1": safe_float(data.get("L1")),
+        "L2": safe_float(data.get("L2")),
+        "L3": safe_float(data.get("L3")),
+        "L4": safe_float(data.get("L4")),
+        "status": str(data.get("status", "")).strip(),
+        "reason": data.get("reason", ""),
+    }
+    if None in (p["L1"], p["L2"], p["L3"], p["L4"]):
+        return None
+    return p
+
+
+def build_consumer() -> Consumer:
+    c = Consumer(
+        {
+            "bootstrap.servers": BOOTSTRAP,
+            "group.id": GROUP_ID,
+            "auto.offset.reset": OFFSET_RESET,
+            "enable.auto.commit": True,
+        }
     )
+    c.subscribe([TOPIC_RAW, TOPIC_PROFILES, TOPIC_NIO])
+    return c
 
 
-def _get_redis() -> Optional["redis.Redis"]:
+# -----------------------------
+# Redis (Streams)
+# -----------------------------
+def get_redis() -> Optional["redis.Redis"]:
     if not ENABLE_REDIS_CACHE:
         return None
     try:
@@ -103,33 +143,25 @@ def _get_redis() -> Optional["redis.Redis"]:
         return None
 
 
-def _redis_xadd_plot(r: "redis.Redis", p: PlotPoint) -> None:
-    fields = {
-        "length_mm": f"{p.length_mm}",
-        "diameter_mm": f"{p.diameter_mm}",
-    }
-    if p.hard_temp is not None:
-        fields["hard_temp"] = f"{p.hard_temp}"
-    if p.temper_temp is not None:
-        fields["temper_temp"] = f"{p.temper_temp}"
-    if p.ts is not None:
-        fields["ts"] = p.ts
-
+def xadd_plot(r: "redis.Redis", p: dict) -> None:
+    fields = {"length_mm": str(p["length_mm"]), "diameter_mm": str(p["diameter_mm"])}
+    if p.get("hard_temp") is not None:
+        fields["hard_temp"] = str(p["hard_temp"])
+    if p.get("temper_temp") is not None:
+        fields["temper_temp"] = str(p["temper_temp"])
+    if p.get("ts"):
+        fields["ts"] = p["ts"]
     r.xadd(STREAM_PLOT, fields, maxlen=REDIS_MAXLEN_PLOT, approximate=True)
 
 
-def _redis_xadd_metrics(r: "redis.Redis", total_profiles: int, nio_profiles: int, ts: Optional[str]) -> None:
-    fields = {
-        "total_profiles": str(total_profiles),
-        "nio_profiles": str(nio_profiles),
-    }
-    if ts is not None:
+def xadd_metrics(r: "redis.Redis", total_profiles: int, nio_profiles: int, ts: Optional[str]) -> None:
+    fields = {"total_profiles": str(total_profiles), "nio_profiles": str(nio_profiles)}
+    if ts:
         fields["ts"] = ts
-
     r.xadd(STREAM_METRICS, fields, maxlen=REDIS_MAXLEN_METRICS, approximate=True)
 
 
-def _redis_clear_streams(r: "redis.Redis") -> None:
+def clear_streams(r: "redis.Redis") -> None:
     try:
         r.delete(STREAM_PLOT)
     except Exception:
@@ -141,186 +173,158 @@ def _redis_clear_streams(r: "redis.Redis") -> None:
 
 
 # -----------------------------
-# Kafka Consumer Thread State
+# Shared state (thread-safe)
 # -----------------------------
-class StreamState:
-    """Thread-safe shared state between Kafka polling thread and Streamlit UI."""
-
-    def __init__(self, max_points: int):
+class State:
+    def __init__(self):
         self.lock = threading.Lock()
-        self.points: Deque[PlotPoint] = deque(maxlen=max_points)
+        self.points = deque(maxlen=MAX_POINTS)
+
         self.total_profiles = 0
         self.nio_profiles = 0
-        self.last_raw_ts: Optional[str] = None
-        self.last_error: Optional[str] = None
+        self.last_raw_ts = None
+        self.last_error = None
 
-        # redis/cache status
-        self.redis_connected: bool = False
+        # running mean ref for L1..L4
+        self.ref_count = 0
+        self.ref_mean = {"L1": 0.0, "L2": 0.0, "L3": 0.0, "L4": 0.0}
 
+        # last n.i.O. profiles debug rows
+        self.nio_debug = deque(maxlen=MAX_NIO_DEBUG)
 
-def _build_consumer() -> Consumer:
-    conf = {
-        "bootstrap.servers": BOOTSTRAP,
-        "group.id": GROUP_ID,
-        "auto.offset.reset": OFFSET_RESET,
-        "enable.auto.commit": True,
-        "session.timeout.ms": 30_000,
-        "heartbeat.interval.ms": 10_000,
-    }
-    c = Consumer(conf)
-    c.subscribe([TOPIC_RAW, TOPIC_PROFILES, TOPIC_NIO])
-    return c
+        # redis status
+        self.redis_ok = False
 
 
-def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
-    # Create Redis connection once; retry occasionally if down
-    r = _get_redis()
-    last_redis_retry = 0.0
+def poll_loop(state: State, stop: threading.Event):
+    # Redis: try connect, then retry every 5s if down
+    r = get_redis()
+    last_retry = time.time()
 
-    def ensure_redis() -> Optional["redis.Redis"]:
-        nonlocal r, last_redis_retry
+    def ensure_redis():
+        nonlocal r, last_retry
         if not ENABLE_REDIS_CACHE:
-            state.redis_connected = False
+            state.redis_ok = False
             return None
         if r is not None:
-            state.redis_connected = True
+            state.redis_ok = True
             return r
-        # retry every 5s
-        now = time.time()
-        if now - last_redis_retry >= 5.0:
-            last_redis_retry = now
-            r = _get_redis()
-        state.redis_connected = r is not None
+        if time.time() - last_retry > 5:
+            last_retry = time.time()
+            r = get_redis()
+        state.redis_ok = r is not None
         return r
 
-    # Kafka
     try:
-        consumer = _build_consumer()
+        c = build_consumer()
     except Exception as e:
         with state.lock:
-            state.last_error = f"Kafka Consumer konnte nicht starten: {e}"
+            state.last_error = f"Kafka Consumer start failed: {e}"
         return
 
-    last_metrics_flush = 0.0
-    last_metrics_total = -1
-    last_metrics_nio = -1
-    last_metrics_ts: Optional[str] = None
-
     try:
-        while not stop_event.is_set():
-            msg = consumer.poll(0.5)
-
+        while not stop.is_set():
+            msg = c.poll(0.5)
             if msg is None:
-                # maybe flush metrics periodically even without messages
-                now = time.time()
-                if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
-                    rr = ensure_redis()
-                    if rr is not None:
-                        with state.lock:
-                            t = state.total_profiles
-                            n = state.nio_profiles
-                            ts = state.last_raw_ts
-                        if (t != last_metrics_total) or (n != last_metrics_nio) or (ts != last_metrics_ts):
-                            try:
-                                _redis_xadd_metrics(rr, t, n, ts)
-                                last_metrics_total, last_metrics_nio, last_metrics_ts = t, n, ts
-                            except Exception:
-                                pass
-                        last_metrics_flush = now
                 continue
-
             if msg.error():
                 with state.lock:
                     state.last_error = str(msg.error())
                 continue
 
-            # If we are here, message is OK -> clear any old error
+            topic = msg.topic()
             with state.lock:
                 state.last_error = None
 
-            topic = msg.topic()
+            # RAW -> plot points (+ Redis stream)
+            if topic == TOPIC_RAW:
+                p = parse_raw(msg.value())
+                if not p:
+                    continue
+                with state.lock:
+                    state.points.append(p)
+                    state.last_raw_ts = p["ts"]
 
-            # 1) KPI events (counts) based on topic
+                rr = ensure_redis()
+                if rr is not None:
+                    try:
+                        xadd_plot(rr, p)
+                    except Exception:
+                        pass
+                continue
+
+            # profiles -> total + ref mean + debug for n.i.O. (evaluate vs mean BEFORE update)
             if topic == TOPIC_PROFILES:
+                prof = parse_profile(msg.value())
                 with state.lock:
                     state.total_profiles += 1
 
-                now = time.time()
-                if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
+                    if prof:
+                        if state.ref_count > 0:
+                            mean = dict(state.ref_mean)
+                            dev = {k: prof[k] - mean[k] for k in ("L1", "L2", "L3", "L4")}
+                            absdev = {k: abs(dev[k]) for k in dev}
+                        else:
+                            mean, dev, absdev = None, None, None
+
+                        if prof["status"] == "n.i.O.":
+                            state.nio_debug.append(
+                                {
+                                    "profile_id": prof["profile_id"],
+                                    "L1": prof["L1"],
+                                    "L2": prof["L2"],
+                                    "L3": prof["L3"],
+                                    "L4": prof["L4"],
+                                    "mean_L1": (mean["L1"] if mean else None),
+                                    "mean_L2": (mean["L2"] if mean else None),
+                                    "mean_L3": (mean["L3"] if mean else None),
+                                    "mean_L4": (mean["L4"] if mean else None),
+                                    "dev_L1": (dev["L1"] if dev else None),
+                                    "dev_L2": (dev["L2"] if dev else None),
+                                    "dev_L3": (dev["L3"] if dev else None),
+                                    "dev_L4": (dev["L4"] if dev else None),
+                                    "|L1-mean|": (absdev["L1"] if absdev else None),
+                                    "|L2-mean|": (absdev["L2"] if absdev else None),
+                                    "|L3-mean|": (absdev["L3"] if absdev else None),
+                                    "|L4-mean|": (absdev["L4"] if absdev else None),
+                                    "limit_mm": NOK_MM,
+                                    "reason": prof["reason"],
+                                }
+                            )
+
+                        # update mean AFTER evaluation
+                        state.ref_count += 1
+                        n = state.ref_count
+                        for k in ("L1", "L2", "L3", "L4"):
+                            state.ref_mean[k] += (prof[k] - state.ref_mean[k]) / n
+
+                    # write metrics to Redis on each profile
                     rr = ensure_redis()
                     if rr is not None:
-                        with state.lock:
-                            t = state.total_profiles
-                            n = state.nio_profiles
-                            ts = state.last_raw_ts
                         try:
-                            _redis_xadd_metrics(rr, t, n, ts)
-                            last_metrics_total, last_metrics_nio, last_metrics_ts = t, n, ts
+                            xadd_metrics(rr, state.total_profiles, state.nio_profiles, state.last_raw_ts)
                         except Exception:
                             pass
-                    last_metrics_flush = now
                 continue
 
+            # n.i.O. events -> nio counter (+ Redis metrics)
             if topic == TOPIC_NIO:
                 with state.lock:
                     state.nio_profiles += 1
-
-                now = time.time()
-                if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
                     rr = ensure_redis()
                     if rr is not None:
-                        with state.lock:
-                            t = state.total_profiles
-                            n = state.nio_profiles
-                            ts = state.last_raw_ts
                         try:
-                            _redis_xadd_metrics(rr, t, n, ts)
-                            last_metrics_total, last_metrics_nio, last_metrics_ts = t, n, ts
+                            xadd_metrics(rr, state.total_profiles, state.nio_profiles, state.last_raw_ts)
                         except Exception:
                             pass
-                    last_metrics_flush = now
                 continue
-
-            # 2) RAW points for plotting
-            if topic == TOPIC_RAW:
-                p = _parse_raw_message(msg.value())
-                if p is None:
-                    continue
-
-                with state.lock:
-                    state.points.append(p)
-                    state.last_raw_ts = p.ts
-
-                if ENABLE_REDIS_CACHE:
-                    rr = ensure_redis()
-                    if rr is not None:
-                        try:
-                            _redis_xadd_plot(rr, p)
-                        except Exception:
-                            pass
-
-                now = time.time()
-                if ENABLE_REDIS_CACHE and (now - last_metrics_flush) >= METRICS_FLUSH_EVERY_S:
-                    rr = ensure_redis()
-                    if rr is not None:
-                        with state.lock:
-                            t = state.total_profiles
-                            n = state.nio_profiles
-                            ts = state.last_raw_ts
-                        if (t != last_metrics_total) or (n != last_metrics_nio) or (ts != last_metrics_ts):
-                            try:
-                                _redis_xadd_metrics(rr, t, n, ts)
-                                last_metrics_total, last_metrics_nio, last_metrics_ts = t, n, ts
-                            except Exception:
-                                pass
-                    last_metrics_flush = now
 
     except Exception as e:
         with state.lock:
             state.last_error = f"Unexpected error: {e}"
     finally:
         try:
-            consumer.close()
+            c.close()
         except Exception:
             pass
 
@@ -328,127 +332,83 @@ def _poll_loop(state: StreamState, stop_event: threading.Event) -> None:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Wire Dashboard (Kafka + Redis Cache)", layout="wide")
-st.title("Wire Dashboard (Kafka direkt + Redis Cache)")
+st.set_page_config(page_title="Wire Dashboard", layout="wide")
+st.title("Wire Dashboard (Kafka + Redis Streams)")
 
 auto = st.sidebar.checkbox("Auto-Refresh", value=True)
+st.sidebar.caption(f"{BOOTSTRAP} | group.id={GROUP_ID} | offset={OFFSET_RESET}")
+st.sidebar.caption(f"RAW={TOPIC_RAW}")
+st.sidebar.caption(f"PROFILES={TOPIC_PROFILES}")
+st.sidebar.caption(f"NIO={TOPIC_NIO}")
+st.sidebar.caption(f"Redis enabled={ENABLE_REDIS_CACHE} | {REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}")
 
-st.sidebar.markdown("### Kafka")
-st.sidebar.code(
-    "\n".join(
-        [
-            f"bootstrap = {BOOTSTRAP}",
-            f"group.id = {GROUP_ID}",
-            f"offset.reset = {OFFSET_RESET}",
-            "",
-            f"RAW      = {TOPIC_RAW}",
-            f"PROFILES = {TOPIC_PROFILES}",
-            f"NIO      = {TOPIC_NIO}",
-        ]
-    )
-)
-
-st.sidebar.markdown("### Redis Cache")
-st.sidebar.write(f"enabled: **{ENABLE_REDIS_CACHE}**")
-st.sidebar.code(
-    "\n".join(
-        [
-            f"host = {REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
-            f"plot stream    = {STREAM_PLOT} (maxlen≈{REDIS_MAXLEN_PLOT})",
-            f"metrics stream = {STREAM_METRICS} (maxlen≈{REDIS_MAXLEN_METRICS})",
-        ]
-    )
-)
-st.sidebar.caption(f"Refresh: {REFRESH_S}s | Max points (RAM): {MAX_POINTS} | Break Δ: {int(BREAK_DELTA)} mm")
-
-# Init background thread once per session
-if "stream_state" not in st.session_state:
-    st.session_state.stream_state = StreamState(max_points=MAX_POINTS)
-    st.session_state.stop_event = threading.Event()
-    t = threading.Thread(
-        target=_poll_loop,
-        args=(st.session_state.stream_state, st.session_state.stop_event),
-        daemon=True,
-        name="kafka-poll-thread",
-    )
-    st.session_state.kafka_thread = t
+# init once
+if "state" not in st.session_state:
+    st.session_state.state = State()
+    st.session_state.stop = threading.Event()
+    t = threading.Thread(target=poll_loop, args=(st.session_state.state, st.session_state.stop), daemon=True)
+    st.session_state.thread = t
     t.start()
 
-state: StreamState = st.session_state.stream_state
+state: State = st.session_state.state
 
-col_a, col_b = st.columns([1, 3])
-
-if col_a.button("Reset (RAM + Redis Cache)"):
+if st.button("Reset (RAM + Redis Streams)"):
     with state.lock:
         state.points.clear()
         state.total_profiles = 0
         state.nio_profiles = 0
         state.last_raw_ts = None
         state.last_error = None
+        state.ref_count = 0
+        state.ref_mean = {"L1": 0.0, "L2": 0.0, "L3": 0.0, "L4": 0.0}
+        state.nio_debug.clear()
 
-    if ENABLE_REDIS_CACHE:
-        rr = _get_redis()
-        if rr is not None:
-            _redis_clear_streams(rr)
+    rr = get_redis()
+    if rr is not None:
+        clear_streams(rr)
 
-# Snapshot for UI render
 with state.lock:
     total = state.total_profiles
     nio = state.nio_profiles
     last_ts = state.last_raw_ts
-    last_err = state.last_error
-    redis_ok = state.redis_connected
+    err = state.last_error
+    redis_ok = state.redis_ok
     points = list(state.points)
+    ref_count = state.ref_count
+    ref_mean = dict(state.ref_mean)
+    nio_debug = list(state.nio_debug)
 
-# KPIs
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Erkannte Profile (gesamt)", total)
 c2.metric("n.i.O. Profile", nio)
 c3.metric("Letzter RAW Timestamp", last_ts or "—")
-c4.metric("Redis Cache", "OK" if (ENABLE_REDIS_CACHE and redis_ok) else ("OFF" if not ENABLE_REDIS_CACHE else "DOWN"))
+c4.metric("Redis Cache", "OFF" if not ENABLE_REDIS_CACHE else ("OK" if redis_ok else "DOWN"))
 
-if last_err:
-    st.warning(f"Kafka Status: {last_err}")
+if err:
+    st.warning(f"Kafka: {err}")
 
-# Plot
 if not points:
-    st.info("Noch keine RAW-Daten empfangen. Läuft der Producer? Ist das RAW-Topic korrekt?")
+    st.info("Noch keine RAW-Daten. Läuft der Producer? Topic korrekt?")
 else:
-    rows = [
-        {
-            "length_mm": p.length_mm,
-            "diameter_mm": p.diameter_mm,
-            "hard_temp": p.hard_temp if p.hard_temp is not None else float("nan"),
-            "temper_temp": p.temper_temp if p.temper_temp is not None else float("nan"),
-        }
-        for p in points
-    ]
-
-    df = (
-        pd.DataFrame(rows)
-        .dropna(subset=["length_mm"])
-        .sort_values("length_mm")
-        .set_index("length_mm")
-    )
-
-    st.subheader("Durchmesser + Temperaturen über Drahtlänge (2 Y-Achsen)")
+    df = pd.DataFrame(points).sort_values("length_mm").set_index("length_mm")
 
     x = df.index.to_list()
     y_d = df["diameter_mm"].tolist()
     y_h = df["hard_temp"].tolist()
     y_t = df["temper_temp"].tolist()
 
+    # break lines when length jumps
     for i in range(1, len(x)):
         if abs(x[i] - x[i - 1]) > BREAK_DELTA:
             y_d[i] = None
             y_h[i] = None
             y_t[i] = None
 
+    st.subheader("Durchmesser + Temperaturen über Drahtlänge (2 Y-Achsen)")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x, y=y_d, name="Durchmesser [mm]", yaxis="y1"))
     fig.add_trace(go.Scatter(x=x, y=y_h, name="Härtetemperatur [°C]", yaxis="y2"))
     fig.add_trace(go.Scatter(x=x, y=y_t, name="Anlasstemperatur [°C]", yaxis="y2"))
-
     fig.update_layout(
         xaxis=dict(title="Drahtlänge [mm]"),
         yaxis=dict(title="Durchmesser [mm]"),
@@ -456,14 +416,24 @@ else:
         legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="left", x=0),
         margin=dict(l=40, r=40, t=40, b=60),
     )
-
-    # Streamlit warning says use width='stretch' instead of use_container_width=True
     st.plotly_chart(fig, width="stretch")
 
     with st.expander("Letzte Punkte (Debug)"):
         st.dataframe(df.tail(25), width="stretch")
 
-# Auto refresh
+    with st.expander("n.i.O. Profile (Debug)"):
+        if nio_debug:
+            st.dataframe(pd.DataFrame(nio_debug).tail(MAX_NIO_DEBUG), width="stretch")
+        else:
+            st.info("Noch keine n.i.O. Profile empfangen.")
+
+    with st.expander("Aktueller Mittelwert (Referenz für L1–L4)"):
+        if ref_count <= 0:
+            st.info("Noch keine Profile erkannt.")
+        else:
+            st.write(f"n = {ref_count} | limit = ±{NOK_MM} mm")
+            st.dataframe(pd.DataFrame([ref_mean]), width="stretch")
+
 if auto:
     time.sleep(REFRESH_S)
     st.rerun()

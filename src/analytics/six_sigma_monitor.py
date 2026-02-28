@@ -1,107 +1,229 @@
-import os
-import json
-import time
-import statistics
+import os, json, time, statistics
 from collections import deque
 from datetime import datetime, timezone
+
+import redis
 from confluent_kafka import Consumer, Producer
 
 
-class SixSigmaMonitor:
+METRICS = {
+    "fHaertetemperatur (Haerten)": "hard",
+    "fAnlasstemperatur (Anlassen)": "anneal",
+}
 
+
+def fnum(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip().replace(",", ".")
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def ts_iso(s: str) -> float:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+class SixSigma:
     def __init__(self):
-        bootstrap   = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
-        self.input  = os.getenv("INPUT_TOPIC", "1031103_1000")
-        self.output = os.getenv("ALERT_TOPIC", "1031103_801")
-        self.window = int(os.getenv("WINDOW_SECONDS", "300"))
+        boot = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
+        self.t_in = os.getenv("INPUT_TOPIC", "1031103_1000")
+        self.t_out = os.getenv("ALERT_TOPIC", "1031103_801")
+        self.win_s = int(os.getenv("WINDOW_SECONDS", "300"))
+        self.min_pts = int(os.getenv("MIN_POINTS", "30"))
+        self.offset = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
 
-        self.consumer = Consumer({"bootstrap.servers": bootstrap, "group.id": "six-sigma-monitor", "auto.offset.reset": "latest"})
-        self.producer = Producer({"bootstrap.servers": bootstrap})
+        self.c = Consumer(
+            {
+                "bootstrap.servers": boot,
+                "group.id": os.getenv("KAFKA_GROUP_ID", "six-sigma-monitor"),
+                "auto.offset.reset": self.offset,
+                "enable.auto.commit": True,
+            }
+        )
+        self.p = Producer({"bootstrap.servers": boot})
 
-        self.windows = {"fHaertetemperatur (Haerten)": deque(), "fAnlasstemperatur (Anlassen)": deque()}
-        self.events  = {"fHaertetemperatur (Haerten)": None,    "fAnlasstemperatur (Anlassen)": None}
+        self.w = {m: deque() for m in METRICS}      # metric -> deque[(ts,val)]
+        self.e = {m: None for m in METRICS}         # metric -> event dict / None
 
-    def update_window(self, metric, ts, value):
-        self.windows[metric].append((ts, value))
-        while self.windows[metric] and ts - self.windows[metric][0][0] > self.window:
-            self.windows[metric].popleft()
+        self.redis_on = os.getenv("ENABLE_REDIS_STATE", "false").lower() in ("1","true","yes","y","on")
+        self.r = None
+        self.pref = os.getenv("REDIS_SIXSIGMA_STREAM_PREFIX", "sixsigma:window")
+        self.s_state = os.getenv("REDIS_SIXSIGMA_STATE_STREAM", "sixsigma:state")
+        self.max_w = int(os.getenv("REDIS_MAXLEN_WINDOW", str(max(1000, self.win_s * 12))))
+        self.max_s = int(os.getenv("REDIS_MAXLEN_STATE", "1000"))
 
-    def send(self, payload):
-        self.producer.produce(self.output, json.dumps(payload).encode())
-        self.producer.poll(0)
-        print(f"ALARM: {payload}", flush=True)
+        if self.redis_on:
+            self.r = self.redis_connect()
+            if self.r:
+                self.restore()
 
-    def check_and_alert(self, metric, ts, value):
-        w = self.windows[metric]
-        if len(w) < 30:
+    def redis_connect(self):
+        try:
+            r = redis.Redis(
+                host=os.getenv("REDIS_HOST", "redis"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                db=int(os.getenv("REDIS_DB", "0")),
+                decode_responses=True,
+            )
+            r.ping()
+            return r
+        except Exception:
+            return None
+
+    def s_window(self, metric: str) -> str:
+        return f"{self.pref}:{METRICS[metric]}"
+
+    def restore(self):
+        for metric in METRICS:
+            key = self.s_window(metric)
+            try:
+                items = self.r.xrevrange(key, count=self.max_w)
+            except Exception:
+                items = []
+            pts = []
+            for _id, f in reversed(items):
+                t = fnum(f.get("ts"))
+                v = fnum(f.get("v"))
+                if t is not None and v is not None:
+                    pts.append((t, v))
+            if pts:
+                cut = pts[-1][0] - self.win_s
+                pts = [(t, v) for (t, v) in pts if t >= cut]
+            self.w[metric] = deque(pts)
+
+        try:
+            last = self.r.xrevrange(self.s_state, count=1)
+        except Exception:
+            last = []
+        if last:
+            f = last[0][1]
+            try:
+                ev = json.loads(f.get("events_json", "{}"))
+            except Exception:
+                ev = {}
+            for metric in METRICS:
+                self.e[metric] = ev.get(metric)
+
+    def xadd_point(self, metric: str, ts: float, v: float):
+        if not self.r:
+            return
+        try:
+            self.r.xadd(self.s_window(metric), {"ts": str(ts), "v": str(v)}, maxlen=self.max_w, approximate=True)
+        except Exception:
+            pass
+
+    def xadd_events(self):
+        if not self.r:
+            return
+        try:
+            self.r.xadd(self.s_state, {"events_json": json.dumps(self.e, separators=(",", ":"))},
+                        maxlen=self.max_s, approximate=True)
+        except Exception:
+            pass
+
+    def update(self, metric: str, ts: float, v: float):
+        q = self.w[metric]
+        q.append((ts, v))
+        while q and (ts - q[0][0]) > self.win_s:
+            q.popleft()
+        self.xadd_point(metric, ts, v)
+
+    def send(self, payload: dict):
+        self.p.produce(self.t_out, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        self.p.poll(0)
+
+    def check(self, metric: str, ts: float, v: float):
+        q = self.w[metric]
+        if len(q) < self.min_pts:
             return
 
-        mean     = statistics.mean([v for _, v in w])
-        stdev    = statistics.stdev([v for _, v in w])
-        in_alarm = value > mean + 3 * stdev or value < mean - 3 * stdev
-        e        = self.events[metric]
+        vals = [x for _, x in q]
+        mean = statistics.mean(vals)
+        sd = statistics.stdev(vals)
+        if sd == 0:
+            return
 
-        if in_alarm:
-            if e is None:
-                # Sofort beim ersten Ausreißer alarmieren
-                self.send({"type": "alarm_start", "timestamp": ts, "metric": metric, "value": value})
-                self.events[metric] = {"start": ts, "end": ts, "peak": value, "count": 1}
+        alarm = (v > mean + 3 * sd) or (v < mean - 3 * sd)
+        ev = self.e[metric]
+
+        if alarm:
+            if ev is None:
+                self.send({"type": "alarm_start", "timestamp": ts, "metric": metric, "value": v})
+                self.e[metric] = {"start": ts, "end": ts, "peak": v, "count": 1}
+                self.xadd_events()
             else:
-                e["end"] = ts
-                e["count"] += 1
-                if abs(value - mean) > abs(e["peak"] - mean):
-                    e["peak"] = value
-
-        elif e is not None and ts - e["end"] >= 1.0:
-            # Zusammenfassung wenn Ereignis vorbei
-            self.send({"type": "alarm_summary", "event_start": e["start"], "event_end": e["end"],
-                       "duration_sec": round(e["end"] - e["start"], 2),
-                       "metric": metric, "peak_value": e["peak"], "alarm_count": e["count"]})
-            self.events[metric] = None
+                ev["end"] = ts
+                ev["count"] += 1
+                if abs(v - mean) > abs(ev["peak"] - mean):
+                    ev["peak"] = v
+        else:
+            if ev is not None and (ts - ev["end"]) >= 1.0:
+                self.send(
+                    {
+                        "type": "alarm_summary",
+                        "event_start": ev["start"],
+                        "event_end": ev["end"],
+                        "duration_sec": round(ev["end"] - ev["start"], 2),
+                        "metric": metric,
+                        "peak_value": ev["peak"],
+                        "alarm_count": ev["count"],
+                    }
+                )
+                self.e[metric] = None
+                self.xadd_events()
 
     def run(self):
-        self.consumer.subscribe([self.input])
-        print("SixSigmaMonitor gestartet...", flush=True)
-
-        processed  = 0
-        last_print = time.time()
-
+        self.c.subscribe([self.t_in])
         while True:
-            msg = self.consumer.poll(1.0)
-
-            if msg is None:
-                if time.time() - last_print > 5:
-                    print(f"[alive] processed={processed}", flush=True)
-                    last_print = time.time()
+            msg = self.c.poll(1.0)
+            if msg is None or msg.error():
                 continue
 
-            if msg.error():
-                print(msg.error(), flush=True)
+            try:
+                data = json.loads(msg.value().decode("utf-8"))
+            except Exception:
                 continue
 
-            data = json.loads(msg.value().decode())
-            ts   = datetime.fromisoformat(data["Time"]).replace(tzinfo=timezone.utc).timestamp()
+            t = data.get("Time")
+            if not t:
+                continue
+            ts = ts_iso(t)
 
             hard = anneal = None
-            for item in data["ProcessData"]:
-                if item["Name"] == "fHaertetemperatur (Haerten)":
-                    hard = item["Value"]
-                elif item["Name"] == "fAnlasstemperatur (Anlassen)":
-                    anneal = item["Value"]
+            for it in data.get("ProcessData", []):
+                n = it.get("Name")
+                if n == "fHaertetemperatur (Haerten)":
+                    hard = fnum(it.get("Value"))
+                elif n == "fAnlasstemperatur (Anlassen)":
+                    anneal = fnum(it.get("Value"))
 
             if hard is not None:
-                self.update_window("fHaertetemperatur (Haerten)", ts, hard)
-                self.check_and_alert("fHaertetemperatur (Haerten)", ts, hard)
+                m = "fHaertetemperatur (Haerten)"
+                self.update(m, ts, hard)
+                self.check(m, ts, hard)
 
             if anneal is not None:
-                self.update_window("fAnlasstemperatur (Anlassen)", ts, anneal)
-                self.check_and_alert("fAnlasstemperatur (Anlassen)", ts, anneal)
-
-            processed += 1
-            if time.time() - last_print > 5:
-                print(f"[alive] processed={processed} hard={hard} anneal={anneal}", flush=True)
-                last_print = time.time()
+                m = "fAnlasstemperatur (Anlassen)"
+                self.update(m, ts, anneal)
+                self.check(m, ts, anneal)
 
 
 if __name__ == "__main__":
-    SixSigmaMonitor().run()
+    SixSigma().run()
