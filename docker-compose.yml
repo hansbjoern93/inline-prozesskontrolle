@@ -10,27 +10,33 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-
       CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
-
       KAFKA_LISTENERS: "PLAINTEXT_INTERNAL://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093"
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_INTERNAL://kafka:9092,PLAINTEXT_HOST://localhost:29092"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT_INTERNAL"
-
       KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
-
-      # single-broker safe defaults
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_MIN_INSYNC_REPLICAS: 1
-
     healthcheck:
       test: ["CMD", "bash", "-lc", "cub kafka-ready -b localhost:9092 1 20"]
       interval: 5s
       timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 20
 
   kafka-producer:
@@ -60,7 +66,7 @@ services:
       INPUT_TOPIC: "1031103_1000"
       OUTPUT_TOPIC: "1031103_1000_corr"
       WINDOW_SIZE_SEC: "300"
-      MIN_POINTS: "2500"
+      MIN_POINTS: "1000"
     command: ["python", "-u", "src/analytics/correlation_analyzer.py"]
     restart: unless-stopped
 
@@ -88,17 +94,24 @@ services:
         condition: service_healthy
       kafka-producer:
         condition: service_started
+      redis:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_INPUT_TOPIC: "1031103_1000"
       KAFKA_GROUP_ID: "wire_profile_detector"
       KAFKA_AUTO_OFFSET_RESET: "earliest"
-
       LOG_LEVEL: "INFO"
       NOK_DEVIATION_MM: "30"
-
       RESET_ON_NONMONOTONIC_LENGTH: "true"
       NONMONO_RESET_DELTA_MM: "1000"
+
+      ENABLE_REDIS_STATE: "true"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PROFILE_STATE_STREAM: "profiles:state"
+      REDIS_MAXLEN_STATE: "2000"
     command: ["python", "-u", "src/analytics/profile_detector.py"]
     restart: unless-stopped
 
@@ -107,6 +120,8 @@ services:
     container_name: wire-dashboard
     depends_on:
       kafka:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kafka-producer:
         condition: service_started
@@ -117,7 +132,13 @@ services:
       KAFKA_INPUT_TOPIC: "1031103_1000"
       KAFKA_GROUP_ID: "wire-dashboard-live"
       KAFKA_AUTO_OFFSET_RESET: "earliest"
-      ENABLE_REDIS_CACHE: "false"
+
+      # Redis Cache für Dashboard (aktiv)
+      ENABLE_REDIS_CACHE: "true"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+
       MAX_POINTS: "3000"
       REFRESH_SECONDS: "1.0"
     ports:

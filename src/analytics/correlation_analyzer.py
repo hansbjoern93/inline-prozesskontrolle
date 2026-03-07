@@ -1,47 +1,60 @@
-import os, json
+import os
+import json
 from datetime import datetime, timezone
 
 import numpy as np
 from confluent_kafka import Consumer, Producer
 
 
-SPEED_NAME = "fGeschwindigkeit1 (Drehgeber)"
-TEMP_NAME  = "fHaertetemperatur (Haerten)"
+FELD_GESCHWINDIGKEIT = "fGeschwindigkeit1 (Drehgeber)"
+FELD_HAERTETEMPERATUR = "fHaertetemperatur (Haerten)"
 
 
-def parse_ts(ts_str: str) -> float:
-    # "2026-03-01T08:45:55.400"  (ohne TZ) -> behandeln wir als UTC
-    dt = datetime.fromisoformat(ts_str)
+def parse_zeitstempel(zeit_str: str) -> float:
+    # Zeitstempel ohne Zeitzone werden als UTC behandelt
+    dt = datetime.fromisoformat(zeit_str)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 
-def get_pd_value(record: dict, wanted_name: str):
-    for item in record.get("ProcessData", []):
-        if item.get("Name") == wanted_name:
-            return item.get("Value")
+def hole_prozesswert(datensatz: dict, feldname: str):
+    for eintrag in datensatz.get("ProcessData", []):
+        if eintrag.get("Name") == feldname:
+            return eintrag.get("Value")
     return None
 
 
+def baue_kafka_consumer(kafka_broker: str, topic_eingang: str):
+    consumer = Consumer(
+        {
+            "bootstrap.servers": kafka_broker,
+            "group.id": "korrelations_analyse",
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": True,
+        }
+    )
+    consumer.subscribe([topic_eingang])
+    return consumer
+
+
+def baue_kafka_producer(kafka_broker: str):
+    return Producer({"bootstrap.servers": kafka_broker})
+
+
 def main():
-    bootstrap = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
-    input_topic = os.getenv("INPUT_TOPIC", "1031103_1000")
-    output_topic = os.getenv("OUTPUT_TOPIC", "1031103_1000_corr")
-    window_size = float(os.getenv("WINDOW_SIZE_SEC", "300"))
-    min_points = int(os.getenv("MIN_POINTS", "1000"))
+    kafka_broker = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
+    topic_eingang = os.getenv("INPUT_TOPIC", "1031103_1000")
+    topic_ausgang = os.getenv("OUTPUT_TOPIC", "1031103_1000_corr")
+    fenster_sekunden = float(os.getenv("WINDOW_SIZE_SEC", "300"))
+    min_punkte = int(os.getenv("MIN_POINTS", "1000"))
 
-    consumer = Consumer({
-        "bootstrap.servers": bootstrap,
-        "group.id": "corr-analyzer",
-        "auto.offset.reset": "latest",   
-        "enable.auto.commit": True
-    })
-    producer = Producer({"bootstrap.servers": bootstrap})
-    consumer.subscribe([input_topic])
+    consumer = baue_kafka_consumer(kafka_broker, topic_eingang)
+    producer = baue_kafka_producer(kafka_broker)
 
-    window_start = None
-    speeds, temps = [], []
+    fenster_start = None
+    geschwindigkeiten = []
+    haertetemperaturen = []
 
     while True:
         msg = consumer.poll(1.0)
@@ -51,42 +64,45 @@ def main():
             continue
 
         try:
-            record = json.loads(msg.value().decode("utf-8"))
-            ts_str = record.get("Time")
-            if not ts_str:
+            datensatz = json.loads(msg.value().decode("utf-8"))
+            zeit_str = datensatz.get("Time")
+            if not zeit_str:
                 continue
 
-            ts = parse_ts(ts_str)
-            sp = get_pd_value(record, SPEED_NAME)
-            tp = get_pd_value(record, TEMP_NAME)
-            if sp is None or tp is None:
+            zeitstempel = parse_zeitstempel(zeit_str)
+
+            geschwindigkeit = hole_prozesswert(datensatz, FELD_GESCHWINDIGKEIT)
+            haertetemperatur = hole_prozesswert(datensatz, FELD_HAERTETEMPERATUR)
+
+            if geschwindigkeit is None or haertetemperatur is None:
                 continue
 
-            if window_start is None:
-                window_start = ts
+            if fenster_start is None:
+                fenster_start = zeitstempel
 
-            speeds.append(float(sp))
-            temps.append(float(tp))
+            geschwindigkeiten.append(float(geschwindigkeit))
+            haertetemperaturen.append(float(haertetemperatur))
 
-            if (ts - window_start) >= window_size:
-                if len(speeds) >= min_points:
-                    corr = float(np.corrcoef(speeds, temps)[0, 1])
-                    out = {
-                        "window_start": window_start,
-                        "window_end": ts,
-                        "n": len(speeds),
-                        "corr_pearson": corr
+            if (zeitstempel - fenster_start) >= fenster_sekunden:
+                if len(geschwindigkeiten) >= min_punkte:
+                    korrelation = float(np.corrcoef(geschwindigkeiten, haertetemperaturen)[0, 1])
+
+                    ergebnis = {
+                    "fenster_start": fenster_start,
+                    "fenster_ende": zeitstempel,
+                   "anzahl_punkte": len(geschwindigkeiten),
+                    "pearson_korrelation": korrelation,
                     }
-                    producer.produce(output_topic, json.dumps(out).encode("utf-8"))
+                    producer.produce(topic_ausgang, json.dumps(ergebnis).encode("utf-8"))
                     producer.flush(2)
 
-                window_start = None
-                speeds.clear()
-                temps.clear()
+                fenster_start = None
+                geschwindigkeiten.clear()
+                haertetemperaturen.clear()
 
         except Exception:
             continue
 
 
 if __name__ == "__main__":
-    main()
+    main() 

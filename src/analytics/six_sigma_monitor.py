@@ -1,4 +1,6 @@
-import os, json, time, statistics
+import os
+import json
+import statistics
 from collections import deque
 from datetime import datetime, timezone
 
@@ -6,13 +8,13 @@ import redis
 from confluent_kafka import Consumer, Producer
 
 
-METRICS = {
-    "fHaertetemperatur (Haerten)": "hard",
-    "fAnlasstemperatur (Anlassen)": "anneal",
+MESSGROESSEN = {
+    "fHaertetemperatur (Haerten)": "haerten",
+    "fAnlasstemperatur (Anlassen)": "anlassen",
 }
 
 
-def fnum(x):
+def parse_float_sicher(x):
     if x is None:
         return None
     if isinstance(x, (int, float)):
@@ -31,50 +33,57 @@ def fnum(x):
         return None
 
 
-def ts_iso(s: str) -> float:
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
+def parse_zeitstempel_iso(zeit_str: str) -> float:
+    if zeit_str.endswith("Z"):
+        zeit_str = zeit_str[:-1] + "+00:00"
+    dt = datetime.fromisoformat(zeit_str)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 
-class SixSigma:
+class SechsSigmaMonitor:
     def __init__(self):
-        boot = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
-        self.t_in = os.getenv("INPUT_TOPIC", "1031103_1000")
-        self.t_out = os.getenv("ALERT_TOPIC", "1031103_801")
-        self.win_s = int(os.getenv("WINDOW_SECONDS", "300"))
-        self.min_pts = int(os.getenv("MIN_POINTS", "30"))
-        self.offset = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
+        kafka_broker = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
+        self.topic_eingang = os.getenv("INPUT_TOPIC", "1031103_1000")
+        self.topic_alarm = os.getenv("ALERT_TOPIC", "1031103_801")
+        self.fenster_sekunden = int(os.getenv("WINDOW_SECONDS", "300"))
+        self.min_punkte = int(os.getenv("MIN_POINTS", "30"))
+        self.offset_reset = os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest")
 
-        self.c = Consumer(
+        self.consumer = Consumer(
             {
-                "bootstrap.servers": boot,
+                "bootstrap.servers": kafka_broker,
                 "group.id": os.getenv("KAFKA_GROUP_ID", "six-sigma-monitor"),
-                "auto.offset.reset": self.offset,
+                "auto.offset.reset": self.offset_reset,
                 "enable.auto.commit": True,
             }
         )
-        self.p = Producer({"bootstrap.servers": boot})
+        self.producer = Producer({"bootstrap.servers": kafka_broker})
 
-        self.w = {m: deque() for m in METRICS}      # metric -> deque[(ts,val)]
-        self.e = {m: None for m in METRICS}         # metric -> event dict / None
+        # Messgröße -> deque[(zeitstempel, wert)]
+        self.fenster = {m: deque() for m in MESSGROESSEN}
 
-        self.redis_on = os.getenv("ENABLE_REDIS_STATE", "false").lower() in ("1","true","yes","y","on")
-        self.r = None
-        self.pref = os.getenv("REDIS_SIXSIGMA_STREAM_PREFIX", "sixsigma:window")
-        self.s_state = os.getenv("REDIS_SIXSIGMA_STATE_STREAM", "sixsigma:state")
-        self.max_w = int(os.getenv("REDIS_MAXLEN_WINDOW", str(max(1000, self.win_s * 12))))
-        self.max_s = int(os.getenv("REDIS_MAXLEN_STATE", "1000"))
+        # Messgröße -> laufendes Alarm-Ereignis oder None
+        self.ereignisse = {m: None for m in MESSGROESSEN}
 
-        if self.redis_on:
-            self.r = self.redis_connect()
-            if self.r:
-                self.restore()
+        self.redis_aktiv = os.getenv("ENABLE_REDIS_STATE", "false").lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        self.redis = None
+        self.redis_stream_prefix = os.getenv("REDIS_SIXSIGMA_STREAM_PREFIX", "sixsigma:window")
+        self.redis_status_stream = os.getenv("REDIS_SIXSIGMA_STATE_STREAM", "sixsigma:state")
+        self.redis_maxlen_fenster = int(
+            os.getenv("REDIS_MAXLEN_WINDOW", str(max(1000, self.fenster_sekunden * 12)))
+        )
+        self.redis_maxlen_status = int(os.getenv("REDIS_MAXLEN_STATE", "1000"))
 
-    def redis_connect(self):
+        if self.redis_aktiv:
+            self.redis = self.verbinde_redis()
+            if self.redis:
+                self.lade_status_aus_redis()
+
+    def verbinde_redis(self):
         try:
             r = redis.Redis(
                 host=os.getenv("REDIS_HOST", "redis"),
@@ -87,143 +96,184 @@ class SixSigma:
         except Exception:
             return None
 
-    def s_window(self, metric: str) -> str:
-        return f"{self.pref}:{METRICS[metric]}"
+    def redis_fenster_key(self, messgroesse: str) -> str:
+        return f"{self.redis_stream_prefix}:{MESSGROESSEN[messgroesse]}"
 
-    def restore(self):
-        for metric in METRICS:
-            key = self.s_window(metric)
+    def lade_status_aus_redis(self):
+        for messgroesse in MESSGROESSEN:
+            key = self.redis_fenster_key(messgroesse)
             try:
-                items = self.r.xrevrange(key, count=self.max_w)
+                eintraege = self.redis.xrevrange(key, count=self.redis_maxlen_fenster)
             except Exception:
-                items = []
-            pts = []
-            for _id, f in reversed(items):
-                t = fnum(f.get("ts"))
-                v = fnum(f.get("v"))
-                if t is not None and v is not None:
-                    pts.append((t, v))
-            if pts:
-                cut = pts[-1][0] - self.win_s
-                pts = [(t, v) for (t, v) in pts if t >= cut]
-            self.w[metric] = deque(pts)
+                eintraege = []
+
+            punkte = []
+            for _id, felder in reversed(eintraege):
+                zeitstempel = parse_float_sicher(felder.get("ts"))
+                wert = parse_float_sicher(felder.get("v"))
+                if zeitstempel is not None and wert is not None:
+                    punkte.append((zeitstempel, wert))
+
+            if punkte:
+                grenze = punkte[-1][0] - self.fenster_sekunden
+                punkte = [(t, v) for (t, v) in punkte if t >= grenze]
+
+            self.fenster[messgroesse] = deque(punkte)
 
         try:
-            last = self.r.xrevrange(self.s_state, count=1)
+            letzter_status = self.redis.xrevrange(self.redis_status_stream, count=1)
         except Exception:
-            last = []
-        if last:
-            f = last[0][1]
-            try:
-                ev = json.loads(f.get("events_json", "{}"))
-            except Exception:
-                ev = {}
-            for metric in METRICS:
-                self.e[metric] = ev.get(metric)
+            letzter_status = []
 
-    def xadd_point(self, metric: str, ts: float, v: float):
-        if not self.r:
+        if letzter_status:
+            felder = letzter_status[0][1]
+            try:
+                ereignisse = json.loads(felder.get("events_json", "{}"))
+            except Exception:
+                ereignisse = {}
+
+            for messgroesse in MESSGROESSEN:
+                self.ereignisse[messgroesse] = ereignisse.get(messgroesse)
+
+    def speichere_punkt_in_redis(self, messgroesse: str, zeitstempel: float, wert: float):
+        if not self.redis:
             return
         try:
-            self.r.xadd(self.s_window(metric), {"ts": str(ts), "v": str(v)}, maxlen=self.max_w, approximate=True)
+            self.redis.xadd(
+                self.redis_fenster_key(messgroesse),
+                {"ts": str(zeitstempel), "v": str(wert)},
+                maxlen=self.redis_maxlen_fenster,
+                approximate=True,
+            )
         except Exception:
             pass
 
-    def xadd_events(self):
-        if not self.r:
+    def speichere_ereignisse_in_redis(self):
+        if not self.redis:
             return
         try:
-            self.r.xadd(self.s_state, {"events_json": json.dumps(self.e, separators=(",", ":"))},
-                        maxlen=self.max_s, approximate=True)
+            self.redis.xadd(
+                self.redis_status_stream,
+                {"events_json": json.dumps(self.ereignisse, separators=(",", ":"))},
+                maxlen=self.redis_maxlen_status,
+                approximate=True,
+            )
         except Exception:
             pass
 
-    def update(self, metric: str, ts: float, v: float):
-        q = self.w[metric]
-        q.append((ts, v))
-        while q and (ts - q[0][0]) > self.win_s:
+    def aktualisiere_fenster(self, messgroesse: str, zeitstempel: float, wert: float):
+        q = self.fenster[messgroesse]
+        q.append((zeitstempel, wert))
+
+        while q and (zeitstempel - q[0][0]) > self.fenster_sekunden:
             q.popleft()
-        self.xadd_point(metric, ts, v)
 
-    def send(self, payload: dict):
-        self.p.produce(self.t_out, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        self.p.poll(0)
+        self.speichere_punkt_in_redis(messgroesse, zeitstempel, wert)
 
-    def check(self, metric: str, ts: float, v: float):
-        q = self.w[metric]
-        if len(q) < self.min_pts:
+    def sende_alarm(self, payload: dict):
+        self.producer.produce(
+            self.topic_alarm,
+            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+        self.producer.poll(0)
+
+    def pruefe_alarm(self, messgroesse: str, zeitstempel: float, wert: float):
+        q = self.fenster[messgroesse]
+
+        if len(q) < self.min_punkte:
             return
 
-        vals = [x for _, x in q]
-        mean = statistics.mean(vals)
-        sd = statistics.stdev(vals)
-        if sd == 0:
+        werte = [x for _, x in q]
+        mittelwert = statistics.mean(werte)
+        standardabweichung = statistics.stdev(werte)
+
+        if standardabweichung == 0:
             return
 
-        alarm = (v > mean + 3 * sd) or (v < mean - 3 * sd)
-        ev = self.e[metric]
+        alarm = (
+            wert > mittelwert + 3 * standardabweichung
+            or wert < mittelwert - 3 * standardabweichung
+        )
+
+        ereignis = self.ereignisse[messgroesse]
 
         if alarm:
-            if ev is None:
-                self.send({"type": "alarm_start", "timestamp": ts, "metric": metric, "value": v})
-                self.e[metric] = {"start": ts, "end": ts, "peak": v, "count": 1}
-                self.xadd_events()
-            else:
-                ev["end"] = ts
-                ev["count"] += 1
-                if abs(v - mean) > abs(ev["peak"] - mean):
-                    ev["peak"] = v
-        else:
-            if ev is not None and (ts - ev["end"]) >= 1.0:
-                self.send(
+            if ereignis is None:
+                self.sende_alarm(
                     {
-                        "type": "alarm_summary",
-                        "event_start": ev["start"],
-                        "event_end": ev["end"],
-                        "duration_sec": round(ev["end"] - ev["start"], 2),
-                        "metric": metric,
-                        "peak_value": ev["peak"],
-                        "alarm_count": ev["count"],
+                        "type": "alarm_start",
+                        "timestamp": zeitstempel,
+                        "metric": messgroesse,
+                        "value": wert,
                     }
                 )
-                self.e[metric] = None
-                self.xadd_events()
+                self.ereignisse[messgroesse] = {
+                    "start": zeitstempel,
+                    "end": zeitstempel,
+                    "peak": wert,
+                    "count": 1,
+                }
+                self.speichere_ereignisse_in_redis()
+            else:
+                ereignis["end"] = zeitstempel
+                ereignis["count"] += 1
+                if abs(wert - mittelwert) > abs(ereignis["peak"] - mittelwert):
+                    ereignis["peak"] = wert
+        else:
+            if ereignis is not None and (zeitstempel - ereignis["end"]) >= 1.0:
+                self.sende_alarm(
+                    {
+                        "type": "alarm_summary",
+                        "event_start": ereignis["start"],
+                        "event_end": ereignis["end"],
+                        "duration_sec": round(ereignis["end"] - ereignis["start"], 2),
+                        "metric": messgroesse,
+                        "peak_value": ereignis["peak"],
+                        "alarm_count": ereignis["count"],
+                    }
+                )
+                self.ereignisse[messgroesse] = None
+                self.speichere_ereignisse_in_redis()
 
     def run(self):
-        self.c.subscribe([self.t_in])
+        self.consumer.subscribe([self.topic_eingang])
+
         while True:
-            msg = self.c.poll(1.0)
+            msg = self.consumer.poll(1.0)
             if msg is None or msg.error():
                 continue
 
             try:
-                data = json.loads(msg.value().decode("utf-8"))
+                daten = json.loads(msg.value().decode("utf-8"))
             except Exception:
                 continue
 
-            t = data.get("Time")
-            if not t:
+            zeit_str = daten.get("Time")
+            if not zeit_str:
                 continue
-            ts = ts_iso(t)
 
-            hard = anneal = None
-            for it in data.get("ProcessData", []):
-                n = it.get("Name")
-                if n == "fHaertetemperatur (Haerten)":
-                    hard = fnum(it.get("Value"))
-                elif n == "fAnlasstemperatur (Anlassen)":
-                    anneal = fnum(it.get("Value"))
+            zeitstempel = parse_zeitstempel_iso(zeit_str)
 
-            if hard is not None:
-                m = "fHaertetemperatur (Haerten)"
-                self.update(m, ts, hard)
-                self.check(m, ts, hard)
+            haertetemperatur = None
+            anlasstemperatur = None
 
-            if anneal is not None:
-                m = "fAnlasstemperatur (Anlassen)"
-                self.update(m, ts, anneal)
-                self.check(m, ts, anneal)
+            for eintrag in daten.get("ProcessData", []):
+                name = eintrag.get("Name")
+                if name == "fHaertetemperatur (Haerten)":
+                    haertetemperatur = parse_float_sicher(eintrag.get("Value"))
+                elif name == "fAnlasstemperatur (Anlassen)":
+                    anlasstemperatur = parse_float_sicher(eintrag.get("Value"))
+
+            if haertetemperatur is not None:
+                messgroesse = "fHaertetemperatur (Haerten)"
+                self.aktualisiere_fenster(messgroesse, zeitstempel, haertetemperatur)
+                self.pruefe_alarm(messgroesse, zeitstempel, haertetemperatur)
+
+            if anlasstemperatur is not None:
+                messgroesse = "fAnlasstemperatur (Anlassen)"
+                self.aktualisiere_fenster(messgroesse, zeitstempel, anlasstemperatur)
+                self.pruefe_alarm(messgroesse, zeitstempel, anlasstemperatur)
 
 
 if __name__ == "__main__":
-    SixSigma().run()
+    SechsSigmaMonitor().run()
